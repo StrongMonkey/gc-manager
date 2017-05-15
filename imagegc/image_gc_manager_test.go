@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors.
+Copyright (c) 2017 [Rancher Labs, Inc.](http://rancher.com), Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -12,454 +12,403 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
+
+Adapted from Kubernetes gc manager. See https://github.com/kubernetes/kubernetes
 */
 
-package images
+package imagegc
 
 import (
-	"fmt"
+	"io/ioutil"
+	"sync"
 	"testing"
 	"time"
 
-	cadvisorapiv2 "github.com/google/cadvisor/info/v2"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
-	"k8s.io/kubernetes/pkg/client/record"
-	cadvisortest "k8s.io/kubernetes/pkg/kubelet/cadvisor/testing"
-	"k8s.io/kubernetes/pkg/kubelet/container"
-	containertest "k8s.io/kubernetes/pkg/kubelet/container/testing"
-	"k8s.io/kubernetes/pkg/util/clock"
+	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/client"
+	"github.com/pkg/errors"
+	"github.com/shirou/gopsutil/disk"
+	"golang.org/x/net/context"
+	"gopkg.in/check.v1"
 )
 
-var zero time.Time
+const (
+	testImageUUID = "daishan1992/echo-hello:latest"
+)
 
-func newRealImageGCManager(policy ImageGCPolicy) (*realImageGCManager, *containertest.FakeRuntime, *cadvisortest.Mock) {
-	fakeRuntime := &containertest.FakeRuntime{}
-	mockCadvisor := new(cadvisortest.Mock)
-	return &realImageGCManager{
-		runtime:      fakeRuntime,
-		policy:       policy,
-		imageRecords: make(map[string]*imageRecord),
-		cadvisor:     mockCadvisor,
-		recorder:     &record.FakeRecorder{},
-	}, fakeRuntime, mockCadvisor
+// Hook up gocheck into the "go test" runner.
+func Test(t *testing.T) {
+	check.TestingT(t)
 }
 
-// Accessors used for thread-safe testing.
-func (im *realImageGCManager) imageRecordsLen() int {
-	im.imageRecordsLock.Lock()
-	defer im.imageRecordsLock.Unlock()
-	return len(im.imageRecords)
-}
-func (im *realImageGCManager) getImageRecord(name string) (*imageRecord, bool) {
-	im.imageRecordsLock.Lock()
-	defer im.imageRecordsLock.Unlock()
-	v, ok := im.imageRecords[name]
-	vCopy := *v
-	return &vCopy, ok
+type ComputeTestSuite struct {
 }
 
-// Returns the id of the image with the given ID.
-func imageID(id int) string {
-	return fmt.Sprintf("image-%d", id)
+var _ = check.Suite(&ComputeTestSuite{})
+
+func (s *ComputeTestSuite) SetUpSuite(c *check.C) {
 }
 
-// Returns the name of the image with the given ID.
-func imageName(id int) string {
-	return imageID(id) + "-name"
+type containerRuntimeFake struct {
+	containerList []types.Container
+
+	imageList []types.ImageSummary
 }
 
-// Make an image with the specified ID.
-func makeImage(id int, size int64) container.Image {
-	return container.Image{
-		ID:   imageID(id),
-		Size: size,
+func (c *containerRuntimeFake) ContainerList(ctx context.Context, options types.ContainerListOptions) ([]types.Container, error) {
+	return c.containerList, nil
+}
+
+func (c *containerRuntimeFake) ImageInspectWithRaw(ctx context.Context, imageID string) (types.ImageInspect, []byte, error) {
+	return types.ImageInspect{ID: imageID}, nil, nil
+}
+
+func (c *containerRuntimeFake) ImageList(ctx context.Context, options types.ImageListOptions) ([]types.ImageSummary, error) {
+	return c.imageList, nil
+}
+
+func (c *containerRuntimeFake) ImageRemove(ctx context.Context, imageID string, options types.ImageRemoveOptions) ([]types.ImageDelete, error) {
+	for index, image := range c.imageList {
+		if image.ID == imageID {
+			c.imageList = append(c.imageList[:index], c.imageList[index+1:]...)
+		}
 	}
+	return nil, nil
 }
 
-// Make a container with the specified ID. It will use the image with the same ID.
-func makeContainer(id int) *container.Container {
-	return &container.Container{
-		ID:      container.ContainerID{Type: "test", ID: fmt.Sprintf("container-%d", id)},
-		Image:   imageName(id),
-		ImageID: imageID(id),
-	}
+type diskCollectorFake struct {
+	diskStats *disk.UsageStat
 }
 
-func TestDetectImagesInitialDetect(t *testing.T) {
-	manager, fakeRuntime, _ := newRealImageGCManager(ImageGCPolicy{})
-	fakeRuntime.ImageList = []container.Image{
-		makeImage(0, 1024),
-		makeImage(1, 2048),
-		makeImage(2, 2048),
-	}
-	fakeRuntime.AllPodList = []*containertest.FakePod{
-		{Pod: &container.Pod{
-			Containers: []*container.Container{
-				{
-					ID:      container.ContainerID{Type: "test", ID: fmt.Sprintf("container-%d", 1)},
-					ImageID: imageID(1),
-					// The image filed is not set to simulate a no-name image
-				},
-				{
-					ID:      container.ContainerID{Type: "test", ID: fmt.Sprintf("container-%d", 2)},
-					Image:   imageName(2),
-					ImageID: imageID(2),
-				},
-			},
-		}},
-	}
-
-	startTime := time.Now().Add(-time.Millisecond)
-	err := manager.detectImages(zero)
-	assert := assert.New(t)
-	require.NoError(t, err)
-	assert.Equal(manager.imageRecordsLen(), 3)
-	noContainer, ok := manager.getImageRecord(imageID(0))
-	require.True(t, ok)
-	assert.Equal(zero, noContainer.firstDetected)
-	assert.Equal(zero, noContainer.lastUsed)
-	withContainerUsingNoNameImage, ok := manager.getImageRecord(imageID(1))
-	require.True(t, ok)
-	assert.Equal(zero, withContainerUsingNoNameImage.firstDetected)
-	assert.True(withContainerUsingNoNameImage.lastUsed.After(startTime))
-	withContainer, ok := manager.getImageRecord(imageID(2))
-	require.True(t, ok)
-	assert.Equal(zero, withContainer.firstDetected)
-	assert.True(withContainer.lastUsed.After(startTime))
+func (d *diskCollectorFake) DiskUsage() (*disk.UsageStat, error) {
+	return d.diskStats, nil
 }
 
-func TestDetectImagesWithNewImage(t *testing.T) {
-	// Just one image initially.
-	manager, fakeRuntime, _ := newRealImageGCManager(ImageGCPolicy{})
-	fakeRuntime.ImageList = []container.Image{
-		makeImage(0, 1024),
-		makeImage(1, 2048),
-	}
-	fakeRuntime.AllPodList = []*containertest.FakePod{
-		{Pod: &container.Pod{
-			Containers: []*container.Container{
-				makeContainer(1),
-			},
-		}},
-	}
+type failedDiskCollector struct{}
 
-	err := manager.detectImages(zero)
-	assert := assert.New(t)
-	require.NoError(t, err)
-	assert.Equal(manager.imageRecordsLen(), 2)
+func (d *failedDiskCollector) DiskUsage() (*disk.UsageStat, error) {
+	return nil, errors.New("fake error")
+}
 
-	// Add a new image.
-	fakeRuntime.ImageList = []container.Image{
-		makeImage(0, 1024),
-		makeImage(1, 1024),
-		makeImage(2, 1024),
+func newFakeImageGCManager(policy *GCPolicy) (*imageGCManagerImpl, *containerRuntimeFake, *diskCollectorFake) {
+	fakeRuntime := &containerRuntimeFake{}
+	diskFakeCollector := &diskCollectorFake{}
+	im := &imageGCManagerImpl{
+		policy:           policy,
+		imageRecords:     make(map[string]*imageRecord),
+		imageRecordsLock: sync.Mutex{},
+		initialized:      true,
+		runtime:          fakeRuntime,
+		collector:        diskFakeCollector,
 	}
+	return im, fakeRuntime, diskFakeCollector
+}
 
+func (s *ComputeTestSuite) TestDetectImagesInitialDetect(c *check.C) {
+	manager, fakeRuntime, _ := newFakeImageGCManager(&GCPolicy{})
+	fakeRuntime.imageList = []types.ImageSummary{
+		{ID: "test-a", Size: 100},
+		{ID: "test-b", Size: 200},
+		{ID: "test-c", Size: 300},
+	}
+	fakeRuntime.containerList = []types.Container{
+		{ID: "test-a-con", ImageID: "test-a"},
+		{ID: "test-b-con", ImageID: "test-b"},
+	}
+	var zero time.Time
+	err := manager.detectImage(zero)
+	c.Assert(err, check.IsNil)
+	c.Assert(manager.imageRecords, check.HasLen, 3)
+	c.Assert(manager.imageRecords["test-c"].firstDetectedTime, check.Equals, zero)
+	c.Assert(manager.imageRecords["test-c"].lastUsedTime, check.Equals, zero)
+	c.Assert(manager.imageRecords["test-c"].size, check.Equals, int64(300))
+
+	c.Assert(manager.imageRecords["test-a"].firstDetectedTime, check.Equals, zero)
+	c.Assert(manager.imageRecords["test-b"].firstDetectedTime, check.Equals, zero)
+	c.Assert(manager.imageRecords["test-a"].lastUsedTime, check.Equals, manager.imageRecords["test-b"].lastUsedTime)
+}
+
+func (s *ComputeTestSuite) TestDetectNewImages(c *check.C) {
+	manager, fakeRuntime, _ := newFakeImageGCManager(&GCPolicy{})
+	fakeRuntime.imageList = []types.ImageSummary{
+		{ID: "test-a", Size: 100},
+		{ID: "test-b", Size: 200},
+		{ID: "test-c", Size: 300},
+	}
+	var zero time.Time
+	err := manager.detectImage(zero)
+	c.Assert(err, check.IsNil)
+	c.Assert(manager.imageRecords, check.HasLen, 3)
+	fakeRuntime.imageList = []types.ImageSummary{
+		{ID: "test-a", Size: 100},
+		{ID: "test-b", Size: 200},
+		{ID: "test-c", Size: 300},
+		{ID: "test-d", Size: 400},
+	}
+	fakeRuntime.containerList = []types.Container{
+		{ID: "test-d-con", ImageID: "test-d"},
+	}
 	detectedTime := zero.Add(time.Second)
 	startTime := time.Now().Add(-time.Millisecond)
-	err = manager.detectImages(detectedTime)
-	require.NoError(t, err)
-	assert.Equal(manager.imageRecordsLen(), 3)
-	noContainer, ok := manager.getImageRecord(imageID(0))
-	require.True(t, ok)
-	assert.Equal(zero, noContainer.firstDetected)
-	assert.Equal(zero, noContainer.lastUsed)
-	withContainer, ok := manager.getImageRecord(imageID(1))
-	require.True(t, ok)
-	assert.Equal(zero, withContainer.firstDetected)
-	assert.True(withContainer.lastUsed.After(startTime))
-	newContainer, ok := manager.getImageRecord(imageID(2))
-	require.True(t, ok)
-	assert.Equal(detectedTime, newContainer.firstDetected)
-	assert.Equal(zero, noContainer.lastUsed)
+	err = manager.detectImage(detectedTime)
+	c.Assert(err, check.IsNil)
+	c.Assert(manager.imageRecords, check.HasLen, 4)
+	c.Assert(manager.imageRecords["test-a"].firstDetectedTime, check.Equals, zero)
+	c.Assert(manager.imageRecords["test-d"].firstDetectedTime, check.Equals, detectedTime)
+	c.Assert(manager.imageRecords["test-d"].lastUsedTime.After(startTime), check.Equals, true)
+	c.Assert(manager.imageRecords["test-d"].size, check.Equals, int64(400))
 }
 
-func TestDetectImagesContainerStopped(t *testing.T) {
-	manager, fakeRuntime, _ := newRealImageGCManager(ImageGCPolicy{})
-	fakeRuntime.ImageList = []container.Image{
-		makeImage(0, 1024),
-		makeImage(1, 2048),
+func (s *ComputeTestSuite) TestDetectImageWithRemoving(c *check.C) {
+	manager, fakeRuntime, _ := newFakeImageGCManager(&GCPolicy{})
+	fakeRuntime.imageList = []types.ImageSummary{
+		{ID: "test-a", Size: 100},
+		{ID: "test-b", Size: 200},
+		{ID: "test-c", Size: 300},
 	}
-	fakeRuntime.AllPodList = []*containertest.FakePod{
-		{Pod: &container.Pod{
-			Containers: []*container.Container{
-				makeContainer(1),
-			},
-		}},
-	}
+	var zero time.Time
+	err := manager.detectImage(zero)
+	c.Assert(err, check.IsNil)
+	c.Assert(manager.imageRecords, check.HasLen, 3)
 
-	err := manager.detectImages(zero)
-	assert := assert.New(t)
-	require.NoError(t, err)
-	assert.Equal(manager.imageRecordsLen(), 2)
-	withContainer, ok := manager.getImageRecord(imageID(1))
-	require.True(t, ok)
-
-	// Simulate container being stopped.
-	fakeRuntime.AllPodList = []*containertest.FakePod{}
-	err = manager.detectImages(time.Now())
-	require.NoError(t, err)
-	assert.Equal(manager.imageRecordsLen(), 2)
-	container1, ok := manager.getImageRecord(imageID(0))
-	require.True(t, ok)
-	assert.Equal(zero, container1.firstDetected)
-	assert.Equal(zero, container1.lastUsed)
-	container2, ok := manager.getImageRecord(imageID(1))
-	require.True(t, ok)
-	assert.Equal(zero, container2.firstDetected)
-	assert.True(container2.lastUsed.Equal(withContainer.lastUsed))
+	fakeRuntime.imageList = []types.ImageSummary{}
+	err = manager.detectImage(time.Now())
+	c.Assert(manager.imageRecords, check.HasLen, 0)
 }
 
-func TestDetectImagesWithRemovedImages(t *testing.T) {
-	manager, fakeRuntime, _ := newRealImageGCManager(ImageGCPolicy{})
-	fakeRuntime.ImageList = []container.Image{
-		makeImage(0, 1024),
-		makeImage(1, 2048),
+func (s *ComputeTestSuite) TestFreeSpaceImagesInUseContainersAreIgnored(c *check.C) {
+	manager, fakeRuntime, _ := newFakeImageGCManager(&GCPolicy{})
+	fakeRuntime.imageList = []types.ImageSummary{
+		{ID: "test-a", Size: 100},
+		{ID: "test-b", Size: 200},
+		{ID: "test-c", Size: 300},
 	}
-	fakeRuntime.AllPodList = []*containertest.FakePod{
-		{Pod: &container.Pod{
-			Containers: []*container.Container{
-				makeContainer(1),
-			},
-		}},
+	fakeRuntime.containerList = []types.Container{
+		{ID: "test-c-con", ImageID: "test-c"},
 	}
-
-	err := manager.detectImages(zero)
-	assert := assert.New(t)
-	require.NoError(t, err)
-	assert.Equal(manager.imageRecordsLen(), 2)
-
-	// Simulate both images being removed.
-	fakeRuntime.ImageList = []container.Image{}
-	err = manager.detectImages(time.Now())
-	require.NoError(t, err)
-	assert.Equal(manager.imageRecordsLen(), 0)
+	spaceFreed, err := manager.freeSpace(300, time.Now())
+	c.Assert(err, check.IsNil)
+	c.Assert(spaceFreed, check.Equals, uint64(300))
+	c.Assert(fakeRuntime.imageList, check.HasLen, 1)
 }
 
-func TestFreeSpaceImagesInUseContainersAreIgnored(t *testing.T) {
-	manager, fakeRuntime, _ := newRealImageGCManager(ImageGCPolicy{})
-	fakeRuntime.ImageList = []container.Image{
-		makeImage(0, 1024),
-		makeImage(1, 2048),
+func (s *ComputeTestSuite) TestFreeSpaceRemoveByLeastRecentlyUsed(c *check.C) {
+	manager, fakeRuntime, _ := newFakeImageGCManager(&GCPolicy{})
+	fakeRuntime.imageList = []types.ImageSummary{
+		{ID: "test-a", Size: 200},
+		{ID: "test-b", Size: 200},
 	}
-	fakeRuntime.AllPodList = []*containertest.FakePod{
-		{Pod: &container.Pod{
-			Containers: []*container.Container{
-				makeContainer(1),
-			},
-		}},
+	fakeRuntime.containerList = []types.Container{
+		{ID: "test-a-con", ImageID: "test-a"},
+		{ID: "test-b-con", ImageID: "test-b"},
 	}
+	var zero time.Time
+	err := manager.detectImage(zero)
+	c.Assert(err, check.IsNil)
 
-	spaceFreed, err := manager.freeSpace(2048, time.Now())
-	assert := assert.New(t)
-	require.NoError(t, err)
-	assert.EqualValues(1024, spaceFreed)
-	assert.Len(fakeRuntime.ImageList, 1)
+	fakeRuntime.containerList = []types.Container{
+		{ID: "test-a-con", ImageID: "test-a"},
+	}
+	err = manager.detectImage(time.Now())
+	c.Assert(err, check.IsNil)
+
+	fakeRuntime.containerList = []types.Container{}
+	err = manager.detectImage(time.Now())
+	c.Assert(err, check.IsNil)
+	c.Assert(manager.imageRecords["test-a"].lastUsedTime.After(manager.imageRecords["test-b"].lastUsedTime), check.Equals, true)
+
+	spaceFreed, err := manager.freeSpace(200, time.Now())
+	c.Assert(err, check.IsNil)
+	c.Assert(spaceFreed, check.Equals, uint64(200))
+	c.Assert(fakeRuntime.imageList[0].ID, check.Equals, "test-a")
 }
 
-func TestDeleteUnusedImagesRemoveAllUnusedImages(t *testing.T) {
-	manager, fakeRuntime, _ := newRealImageGCManager(ImageGCPolicy{})
-	fakeRuntime.ImageList = []container.Image{
-		makeImage(0, 1024),
-		makeImage(1, 2048),
-		makeImage(2, 2048),
+func (s *ComputeTestSuite) TestFreeSpaceTiesBrokenByDetectedTime(c *check.C) {
+	manager, fakeRuntime, _ := newFakeImageGCManager(&GCPolicy{})
+	fakeRuntime.imageList = []types.ImageSummary{
+		{ID: "test-a", Size: 200},
 	}
-	fakeRuntime.AllPodList = []*containertest.FakePod{
-		{Pod: &container.Pod{
-			Containers: []*container.Container{
-				makeContainer(2),
-			},
-		}},
-	}
+	var zero time.Time
+	err := manager.detectImage(zero)
+	c.Assert(err, check.IsNil)
 
-	spaceFreed, err := manager.DeleteUnusedImages()
-	assert := assert.New(t)
-	require.NoError(t, err)
-	assert.EqualValues(3072, spaceFreed)
-	assert.Len(fakeRuntime.ImageList, 1)
+	fakeRuntime.imageList = []types.ImageSummary{
+		{ID: "test-a", Size: 200},
+		{ID: "test-b", Size: 200},
+	}
+	err = manager.detectImage(time.Now())
+	c.Assert(err, check.IsNil)
+
+	// make that a is detected before b, but two are used at the same time
+	fakeRuntime.containerList = []types.Container{
+		{ID: "test-a-con", ImageID: "test-a"},
+		{ID: "test-b-con", ImageID: "test-b"},
+	}
+	err = manager.detectImage(time.Now())
+	c.Assert(err, check.IsNil)
+
+	fakeRuntime.containerList = []types.Container{}
+	err = manager.detectImage(time.Now())
+	c.Assert(err, check.IsNil)
+
+	spaceFreed, err := manager.freeSpace(200, time.Now())
+	c.Assert(err, check.IsNil)
+	c.Assert(spaceFreed, check.Equals, uint64(200))
+	c.Assert(fakeRuntime.imageList[0].ID, check.Equals, "test-b")
 }
 
-func TestFreeSpaceRemoveByLeastRecentlyUsed(t *testing.T) {
-	manager, fakeRuntime, _ := newRealImageGCManager(ImageGCPolicy{})
-	fakeRuntime.ImageList = []container.Image{
-		makeImage(0, 1024),
-		makeImage(1, 2048),
-	}
-	fakeRuntime.AllPodList = []*containertest.FakePod{
-		{Pod: &container.Pod{
-			Containers: []*container.Container{
-				makeContainer(0),
-				makeContainer(1),
-			},
-		}},
-	}
-
-	// Make 1 be more recently used than 0.
-	require.NoError(t, manager.detectImages(zero))
-	fakeRuntime.AllPodList = []*containertest.FakePod{
-		{Pod: &container.Pod{
-			Containers: []*container.Container{
-				makeContainer(1),
-			},
-		}},
-	}
-	require.NoError(t, manager.detectImages(time.Now()))
-	fakeRuntime.AllPodList = []*containertest.FakePod{
-		{Pod: &container.Pod{
-			Containers: []*container.Container{},
-		}},
-	}
-	require.NoError(t, manager.detectImages(time.Now()))
-	require.Equal(t, manager.imageRecordsLen(), 2)
-
-	spaceFreed, err := manager.freeSpace(1024, time.Now())
-	assert := assert.New(t)
-	require.NoError(t, err)
-	assert.EqualValues(1024, spaceFreed)
-	assert.Len(fakeRuntime.ImageList, 1)
-}
-
-func TestFreeSpaceTiesBrokenByDetectedTime(t *testing.T) {
-	manager, fakeRuntime, _ := newRealImageGCManager(ImageGCPolicy{})
-	fakeRuntime.ImageList = []container.Image{
-		makeImage(0, 1024),
-	}
-	fakeRuntime.AllPodList = []*containertest.FakePod{
-		{Pod: &container.Pod{
-			Containers: []*container.Container{
-				makeContainer(0),
-			},
-		}},
-	}
-
-	// Make 1 more recently detected but used at the same time as 0.
-	require.NoError(t, manager.detectImages(zero))
-	fakeRuntime.ImageList = []container.Image{
-		makeImage(0, 1024),
-		makeImage(1, 2048),
-	}
-	require.NoError(t, manager.detectImages(time.Now()))
-	fakeRuntime.AllPodList = []*containertest.FakePod{}
-	require.NoError(t, manager.detectImages(time.Now()))
-	require.Equal(t, manager.imageRecordsLen(), 2)
-
-	spaceFreed, err := manager.freeSpace(1024, time.Now())
-	assert := assert.New(t)
-	require.NoError(t, err)
-	assert.EqualValues(2048, spaceFreed)
-	assert.Len(fakeRuntime.ImageList, 1)
-}
-
-func TestGarbageCollectBelowLowThreshold(t *testing.T) {
-	policy := ImageGCPolicy{
+func (s *ComputeTestSuite) TestGarbageCollectBelowLowThreshold(c *check.C) {
+	policy := &GCPolicy{
 		HighThresholdPercent: 90,
 		LowThresholdPercent:  80,
 	}
-	manager, _, mockCadvisor := newRealImageGCManager(policy)
-
-	// Expect 40% usage.
-	mockCadvisor.On("ImagesFsInfo").Return(cadvisorapiv2.FsInfo{
-		Available: 600,
-		Capacity:  1000,
-	}, nil)
-
-	assert.NoError(t, manager.GarbageCollect())
+	manager, _, mockDiskCollector := newFakeImageGCManager(policy)
+	mockDiskCollector.diskStats = &disk.UsageStat{
+		Total:       1000,
+		Used:        600,
+		UsedPercent: 60.0,
+	}
+	err := manager.GarbageCollect()
+	c.Assert(err, check.IsNil)
 }
 
-func TestGarbageCollectCadvisorFailure(t *testing.T) {
-	policy := ImageGCPolicy{
+func (s *ComputeTestSuite) TestGarbageCollectDiskCollectorFailure(c *check.C) {
+	policy := &GCPolicy{
 		HighThresholdPercent: 90,
 		LowThresholdPercent:  80,
 	}
-	manager, _, mockCadvisor := newRealImageGCManager(policy)
+	manager, _, _ := newFakeImageGCManager(policy)
+	manager.collector = &failedDiskCollector{}
 
-	mockCadvisor.On("ImagesFsInfo").Return(cadvisorapiv2.FsInfo{}, fmt.Errorf("error"))
-	assert.NotNil(t, manager.GarbageCollect())
+	err := manager.GarbageCollect()
+	c.Assert(err, check.NotNil)
 }
 
-func TestGarbageCollectBelowSuccess(t *testing.T) {
-	policy := ImageGCPolicy{
+func (s *ComputeTestSuite) TestGarbageCollectBelowSuccess(c *check.C) {
+	policy := &GCPolicy{
 		HighThresholdPercent: 90,
 		LowThresholdPercent:  80,
 	}
-	manager, fakeRuntime, mockCadvisor := newRealImageGCManager(policy)
-
-	// Expect 95% usage and most of it gets freed.
-	mockCadvisor.On("ImagesFsInfo").Return(cadvisorapiv2.FsInfo{
-		Available: 50,
-		Capacity:  1000,
-	}, nil)
-	fakeRuntime.ImageList = []container.Image{
-		makeImage(0, 450),
+	manager, fakeRuntime, mockDiskCollector := newFakeImageGCManager(policy)
+	mockDiskCollector.diskStats = &disk.UsageStat{
+		Total:       1000,
+		Used:        950,
+		UsedPercent: 95.0,
 	}
-
-	assert.NoError(t, manager.GarbageCollect())
+	fakeRuntime.imageList = []types.ImageSummary{
+		{ID: "test-a", Size: 200},
+	}
+	err := manager.GarbageCollect()
+	c.Assert(err, check.IsNil)
+	c.Assert(fakeRuntime.imageList, check.HasLen, 0)
 }
 
-func TestGarbageCollectNotEnoughFreed(t *testing.T) {
-	policy := ImageGCPolicy{
+func (s *ComputeTestSuite) TestGarbageCollectNotEnoughFreed(c *check.C) {
+	policy := &GCPolicy{
 		HighThresholdPercent: 90,
 		LowThresholdPercent:  80,
 	}
-	manager, fakeRuntime, mockCadvisor := newRealImageGCManager(policy)
-
-	// Expect 95% usage and little of it gets freed.
-	mockCadvisor.On("ImagesFsInfo").Return(cadvisorapiv2.FsInfo{
-		Available: 50,
-		Capacity:  1000,
-	}, nil)
-	fakeRuntime.ImageList = []container.Image{
-		makeImage(0, 50),
+	manager, fakeRuntime, mockDiskCollector := newFakeImageGCManager(policy)
+	mockDiskCollector.diskStats = &disk.UsageStat{
+		Total:       1000,
+		Used:        950,
+		UsedPercent: 95.0,
 	}
-
-	assert.NotNil(t, manager.GarbageCollect())
+	fakeRuntime.imageList = []types.ImageSummary{
+		{ID: "test-a", Size: 20},
+	}
+	err := manager.GarbageCollect()
+	c.Assert(err, check.NotNil)
+	c.Assert(fakeRuntime.imageList, check.HasLen, 0)
 }
 
-func TestGarbageCollectImageNotOldEnough(t *testing.T) {
-	policy := ImageGCPolicy{
+func (s *ComputeTestSuite) TestGarbageCollectImageNotOldEnough(c *check.C) {
+	policy := &GCPolicy{
 		HighThresholdPercent: 90,
 		LowThresholdPercent:  80,
 		MinAge:               time.Minute * 1,
 	}
-	fakeRuntime := &containertest.FakeRuntime{}
-	mockCadvisor := new(cadvisortest.Mock)
-	manager := &realImageGCManager{
-		runtime:      fakeRuntime,
-		policy:       policy,
-		imageRecords: make(map[string]*imageRecord),
-		cadvisor:     mockCadvisor,
-		recorder:     &record.FakeRecorder{},
+	manager, fakeRuntime, mockDiskCollector := newFakeImageGCManager(policy)
+	mockDiskCollector.diskStats = &disk.UsageStat{
+		Total:       1000,
+		Used:        950,
+		UsedPercent: 95.0,
 	}
-
-	fakeRuntime.ImageList = []container.Image{
-		makeImage(0, 1024),
-		makeImage(1, 2048),
+	fakeRuntime.imageList = []types.ImageSummary{
+		{ID: "test-a", Size: 100},
 	}
-	// 1 image is in use, and another one is not old enough
-	fakeRuntime.AllPodList = []*containertest.FakePod{
-		{Pod: &container.Pod{
-			Containers: []*container.Container{
-				makeContainer(1),
-			},
-		}},
+	var zero time.Time
+	err := manager.detectImage(zero)
+	c.Assert(err, check.IsNil)
+	fakeRuntime.imageList = []types.ImageSummary{
+		{ID: "test-a", Size: 100},
+		{ID: "test-b", Size: 200},
 	}
+	fakeRuntime.containerList = []types.Container{
+		{ID: "test-a-con", ImageID: "test-a"},
+	}
+	err = manager.detectImage(time.Now())
+	c.Assert(err, check.IsNil)
 
-	fakeClock := clock.NewFakeClock(time.Now())
-	t.Log(fakeClock.Now())
-	require.NoError(t, manager.detectImages(fakeClock.Now()))
-	require.Equal(t, manager.imageRecordsLen(), 2)
-	// no space freed since one image is in used, and another one is not old enough
-	spaceFreed, err := manager.freeSpace(1024, fakeClock.Now())
-	assert := assert.New(t)
-	require.NoError(t, err)
-	assert.EqualValues(0, spaceFreed)
-	assert.Len(fakeRuntime.ImageList, 2)
+	err = manager.GarbageCollect()
+	c.Assert(err, check.NotNil)
+	c.Assert(fakeRuntime.imageList, check.HasLen, 2)
 
-	// move clock by minAge duration, then 1 image will be garbage collected
-	fakeClock.Step(policy.MinAge)
-	spaceFreed, err = manager.freeSpace(1024, fakeClock.Now())
-	require.NoError(t, err)
-	assert.EqualValues(1024, spaceFreed)
-	assert.Len(fakeRuntime.ImageList, 1)
+	manager.policy.MinAge = time.Nanosecond * 1
+
+	err = manager.GarbageCollect()
+	c.Assert(err, check.IsNil)
+	c.Assert(fakeRuntime.imageList, check.HasLen, 1)
+	c.Assert(fakeRuntime.imageList[0].ID, check.Equals, "test-a")
+}
+
+func (s *ComputeTestSuite) TestIntegration(c *check.C) {
+	// not a truly integration test as we still need to fake disk usage
+	policy := &GCPolicy{
+		HighThresholdPercent: 90,
+		LowThresholdPercent:  80,
+		MinAge:               time.Millisecond * 1,
+	}
+	manager, _, _ := newFakeImageGCManager(policy)
+	dockerclient, err := client.NewEnvClient()
+	if err != nil {
+		c.Fatal(err)
+	}
+	//ignore error
+	//_, err = dockerclient.ImageRemove(context.Background(), testImageUUID, types.ImageRemoveOptions{Force: true})
+	//if err != nil {
+	//	c.Fatal(err)
+	//}
+	manager.runtime = dockerclient
+	manager.collector = &diskCollectorFake{}
+
+	// start manager to detect images
+	manager.Start()
+
+	reader, err := dockerclient.ImagePull(context.Background(), testImageUUID, types.ImagePullOptions{})
+	if err != nil {
+		c.Fatal(err)
+	}
+	//wait for pulling
+	_, err = ioutil.ReadAll(reader)
+	if err != nil {
+		c.Fatal(err)
+	}
+	inspect, _, err := dockerclient.ImageInspectWithRaw(context.Background(), testImageUUID)
+	c.Assert(err, check.IsNil)
+	manager.collector = &diskCollectorFake{
+		diskStats: &disk.UsageStat{
+			Used:        950,
+			Total:       1000,
+			UsedPercent: 95.0,
+		},
+	}
+	err = manager.detectImage(time.Now())
+	c.Assert(err, check.IsNil)
+	var zero time.Time
+	manager.imageRecords[inspect.ID].lastUsedTime = zero.Add(-time.Minute)
+	//we don't care the error, but the image should be deleted
+	manager.GarbageCollect()
+	_, _, err = dockerclient.ImageInspectWithRaw(context.Background(), testImageUUID)
+	c.Assert(err, check.NotNil)
 }

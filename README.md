@@ -13,7 +13,7 @@ A microservice that does micro things.
 `./bin/gc-manager`
 
 ## License
-Copyright (c) 2014-2016 [Rancher Labs, Inc.](http://rancher.com)
+Copyright (c) 2017 [Rancher Labs, Inc.](http://rancher.com), Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.

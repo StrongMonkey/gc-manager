@@ -9,10 +9,12 @@ SUFFIX=""
 
 cd $(dirname $0)/../package
 
-TAG=${TAG:-${VERSION}${SUFFIX}}
+TAG=${TAG:-${IMAGE_VERSION}${SUFFIX}}
 REPO=${REPO:-rancher}
 
 cp ../bin/gc-manager .
-docker build -t ${REPO}/gc-manager:${TAG} .
 
-echo Built ${REPO}/gc-manager:${TAG}
+IMAGE=${REPO}/gc-manager:${TAG}
+docker build -t ${IMAGE} .
+echo ${IMAGE} > ../dist/images
+echo Built ${IMAGE}
