@@ -144,7 +144,7 @@ func (im *imageGCManagerImpl) detectImage(ts time.Time) error {
 	if err != nil {
 		return err
 	}
-	containers, err := im.runtime.ContainerList(context.Background(), types.ContainerListOptions{})
+	containers, err := im.runtime.ContainerList(context.Background(), types.ContainerListOptions{All: true})
 	if err != nil {
 		return err
 	}
