@@ -76,6 +76,12 @@ func (c *containerRuntimeFake) ImageRemove(ctx context.Context, imageID string, 
 	return nil, nil
 }
 
+func (c *containerRuntimeFake) Info(ctx context.Context) (types.Info, error) {
+	return types.Info{
+		DriverStatus: [][2]string{{"Data Space Used", "1.0 GB"}, {"Data Space Total", "10.0 GB"}},
+	}, nil
+}
+
 type diskCollectorFake struct {
 	diskStats *disk.UsageStat
 }
@@ -360,6 +366,18 @@ func (s *ComputeTestSuite) TestGarbageCollectImageNotOldEnough(c *check.C) {
 	c.Assert(err, check.IsNil)
 	c.Assert(fakeRuntime.imageList, check.HasLen, 1)
 	c.Assert(fakeRuntime.imageList[0].ID, check.Equals, "test-a")
+}
+
+type fakeDeviceMapperRuntime struct{}
+
+func (s *ComputeTestSuite) TestDeviceMapperDiskUsage(c *check.C) {
+	diskImpl := diskCollectorImpl{
+		driver: "devicemapper",
+		client: &containerRuntimeFake{},
+	}
+	usage, err := diskImpl.DiskUsage()
+	c.Assert(err, check.IsNil)
+	c.Assert(usage.UsedPercent, check.Equals, float64(10.0))
 }
 
 func (s *ComputeTestSuite) TestIntegration(c *check.C) {

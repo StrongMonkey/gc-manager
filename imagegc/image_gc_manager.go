@@ -24,11 +24,20 @@ import (
 	"sync"
 	"time"
 
+	"strconv"
+	"strings"
+
 	"github.com/Sirupsen/logrus"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/client"
 	"github.com/shirou/gopsutil/disk"
 	"golang.org/x/net/context"
+)
+
+const (
+	DataSpaceUsed  = "Data Space Used"
+	DataSpaceTotal = "Data Space Total"
+	Unit           = 1073741824
 )
 
 type GCManager interface {
@@ -47,16 +56,54 @@ type containerRuntime interface {
 	ImageList(ctx context.Context, options types.ImageListOptions) ([]types.ImageSummary, error)
 
 	ImageRemove(ctx context.Context, imageID string, options types.ImageRemoveOptions) ([]types.ImageDelete, error)
+
+	Info(ctx context.Context) (types.Info, error)
 }
 
 type diskCollector interface {
 	DiskUsage() (*disk.UsageStat, error)
 }
 
-type diskCollectorImpl struct{}
+type diskCollectorImpl struct {
+	driver string
+	client containerRuntime
+}
 
 func (d diskCollectorImpl) DiskUsage() (*disk.UsageStat, error) {
-	return disk.Usage(".")
+	if d.driver == "devicemapper" {
+		// not fancy at all
+		info, err := d.client.Info(context.Background())
+		if err != nil {
+			return nil, err
+		}
+		var used uint64
+		var total uint64 = 1
+		for _, status := range info.DriverStatus {
+			if status[0] == DataSpaceUsed {
+				parts := strings.Split(status[1], " ")
+				if len(parts) > 1 {
+					val, err := strconv.ParseFloat(parts[0], 64)
+					if err == nil {
+						used = uint64(val * Unit)
+					}
+				}
+			} else if status[0] == DataSpaceTotal {
+				parts := strings.Split(status[1], " ")
+				if len(parts) > 1 {
+					val, err := strconv.ParseFloat(parts[0], 64)
+					if err == nil {
+						total = uint64(val * Unit)
+					}
+				}
+			}
+		}
+		return &disk.UsageStat{
+			Used:        used,
+			Total:       total,
+			UsedPercent: float64(used) / float64(total) * 100,
+		}, nil
+	}
+	return disk.Usage("/rootfs")
 }
 
 type GCPolicy struct {
@@ -97,7 +144,7 @@ type imageGCManagerImpl struct {
 	collector diskCollector
 }
 
-func NewImageManagerImpl(policy *GCPolicy, client *client.Client) (GCManager, error) {
+func NewImageManagerImpl(policy *GCPolicy, client *client.Client, driver string) (GCManager, error) {
 	// Validate policy.
 	if policy.HighThresholdPercent < 0 || policy.HighThresholdPercent > 100 {
 		return nil, fmt.Errorf("invalid HighThresholdPercent %v, must be in range [0-100]", policy.HighThresholdPercent)
@@ -114,7 +161,7 @@ func NewImageManagerImpl(policy *GCPolicy, client *client.Client) (GCManager, er
 		imageRecordsLock: sync.Mutex{},
 		initialized:      false,
 		runtime:          client,
-		collector:        diskCollectorImpl{},
+		collector:        diskCollectorImpl{client: client, driver: driver},
 	}
 	return im, nil
 }

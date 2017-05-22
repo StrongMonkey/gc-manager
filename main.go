@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"time"
 
+	"context"
 	"github.com/Sirupsen/logrus"
 	"github.com/docker/docker/client"
 	"github.com/rancher/gc-manager/imagegc"
@@ -55,13 +56,18 @@ func run(c *cli.Context) error {
 	if err != nil {
 		interval = 5
 	}
+	info, err := dockerclient.Info(context.Background())
+	if err != nil {
+		return err
+	}
+
 	policy := &imagegc.GCPolicy{
 		HighThresholdPercent: highThresholdPercent,
 		LowThresholdPercent:  lowThresholdPercent,
 		MinAge:               time.Minute * time.Duration(minAge),
 		GCInterval:           time.Minute * time.Duration(interval),
 	}
-	gcManager, err := imagegc.NewImageManagerImpl(policy, dockerclient)
+	gcManager, err := imagegc.NewImageManagerImpl(policy, dockerclient, info.Driver)
 	if err != nil {
 		return err
 	}
